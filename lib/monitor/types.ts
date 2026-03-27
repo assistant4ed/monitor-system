@@ -1,10 +1,82 @@
 export type ServiceStatus = "healthy" | "degraded" | "down" | "unknown";
-
 export type AlertSeverity = "critical" | "warning" | "info";
-
 export type AlertStatus = "active" | "acknowledged" | "resolved";
-
 export type MetricType = "counter" | "gauge" | "histogram";
+
+// ─── Agent types ──────────────────────────────────────────
+
+export type AgentStatus = "idle" | "thinking" | "responding" | "tool_use" | "error" | "offline";
+
+export interface AgentInfo {
+  id: string;
+  name: string;
+  model: string;
+  provider: string;
+  status: AgentStatus;
+  role?: string;
+  parentId?: string;
+  createdAt: string;
+  lastActiveAt: string;
+  tokens: TokenUsage;
+  costUsd: number;
+  requestCount: number;
+}
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+  thinking: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+}
+
+export interface TokenSnapshot {
+  timestamp: string;
+  agentId: string;
+  tokens: TokenUsage;
+  costUsd: number;
+  deltaInput: number;
+  deltaOutput: number;
+  deltaThinking: number;
+}
+
+export interface ThinkingStep {
+  id: string;
+  agentId: string;
+  agentName: string;
+  model: string;
+  type: "thinking" | "response" | "tool_call" | "tool_result" | "error" | "system";
+  content: string;
+  tokenCount?: number;
+  durationMs?: number;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentMessage {
+  id: string;
+  fromAgentId: string;
+  fromAgentName: string;
+  toAgentId: string;
+  toAgentName: string;
+  type: "request" | "response" | "delegation" | "result" | "error";
+  content: string;
+  tokenCount?: number;
+  timestamp: string;
+}
+
+export interface AgentDashboardData {
+  agents: AgentInfo[];
+  totalTokens: TokenUsage;
+  totalCostUsd: number;
+  tokenHistory: TokenSnapshot[];
+  thinkingFlow: ThinkingStep[];
+  communications: AgentMessage[];
+  tokensPerSecond: number;
+}
+
+// ─── Existing types ───────────────────────────────────────
 
 export interface ServiceCheck {
   name: string;
