@@ -77,26 +77,21 @@ interface OpenAIClient {
 }
 
 export function createMonitoredOpenAI(openai: OpenAIClient, config: MonitorConfig) {
-  const monitor = new MonitorClient(config.monitorUrl, config.apiKey);
+  const monitor = new MonitorClient(config.monitorUrl, { apiKey: config.apiKey });
   let registered = false;
-
-  async function ensureRegistered(model: string) {
-    if (registered) return;
-    registered = true;
-    await monitor.registerAgent({
-      id: config.agentId,
-      name: config.agentName,
-      model,
-      provider: "openai",
-    });
-  }
 
   const originalCreate = openai.chat.completions.create.bind(openai.chat.completions);
 
   const monitoredCreate = async (params: Record<string, unknown>): Promise<OpenAIResponse> => {
     const model = params.model as string;
-    await ensureRegistered(model);
-    await monitor.setStatus(config.agentId, "thinking");
+
+    if (!registered) {
+      registered = true;
+      monitor.registerAgent({ id: config.agentId, name: config.agentName, model, provider: "openai" });
+    }
+
+    monitor.setStatus(config.agentId, "thinking");
+    monitor.flush();
 
     const startTime = Date.now();
 
@@ -105,34 +100,32 @@ export function createMonitoredOpenAI(openai: OpenAIClient, config: MonitorConfi
       const durationMs = Date.now() - startTime;
       const usage = response.usage;
 
-      const inputTokens = usage.prompt_tokens || 0;
-      const outputTokens = usage.completion_tokens || 0;
-      const thinkingTokens = usage.completion_tokens_details?.reasoning_tokens || 0;
-      const cost = estimateCost(model, inputTokens, outputTokens);
+      const inp = usage.prompt_tokens || 0;
+      const out = usage.completion_tokens || 0;
+      const think = usage.completion_tokens_details?.reasoning_tokens || 0;
+      const cost = estimateCost(model, inp, out);
 
-      await monitor.trackTokens(
-        config.agentId,
-        { input: inputTokens, output: outputTokens, thinking: thinkingTokens },
-        cost,
-      );
+      monitor.trackTokens(config.agentId, { input: inp, output: out, thinking: think }, cost);
 
       const choice = response.choices[0];
       if (choice?.message?.content) {
-        await monitor.think(config.agentId, config.agentName, model, "response", choice.message.content.slice(0, 2000), { tokenCount: outputTokens, durationMs });
+        monitor.think(config.agentId, config.agentName, model, "response", choice.message.content.slice(0, 800), { tokenCount: out, durationMs });
       }
 
       if (choice?.message?.tool_calls?.length) {
-        const calls = choice.message.tool_calls.map((tc) => `${tc.function.name}(${tc.function.arguments.slice(0, 200)})`).join("\n");
-        await monitor.think(config.agentId, config.agentName, model, "tool_call", calls);
-        await monitor.setStatus(config.agentId, "tool_use");
+        const calls = choice.message.tool_calls.map((tc) => `${tc.function.name}(${tc.function.arguments.slice(0, 150)})`).join("\n");
+        monitor.think(config.agentId, config.agentName, model, "tool_call", calls.slice(0, 800));
+        monitor.setStatus(config.agentId, "tool_use");
       } else {
-        await monitor.setStatus(config.agentId, "idle");
+        monitor.setStatus(config.agentId, "idle");
       }
 
+      monitor.flush();
       return response;
     } catch (err) {
-      await monitor.setStatus(config.agentId, "error");
-      await monitor.think(config.agentId, config.agentName, model, "error", String(err));
+      monitor.setStatus(config.agentId, "error");
+      monitor.think(config.agentId, config.agentName, model, "error", String(err).slice(0, 300));
+      monitor.flush();
       throw err;
     }
   };

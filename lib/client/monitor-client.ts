@@ -1,15 +1,14 @@
 /**
- * Monitor Client SDK
+ * Monitor Client SDK — Zero-overhead edition
  *
- * Drop this file into ANY project to send data to your monitor dashboard.
- * Works in Node.js, Edge, Bun, Deno — anywhere fetch() exists.
+ * All calls are fire-and-forget by default. Your code never waits for
+ * the monitor. One HTTP call per AI response via batching.
  *
  * Usage:
  *   import { MonitorClient } from "./monitor-client";
  *   const monitor = new MonitorClient("https://monitor-system-one.vercel.app");
- *   await monitor.registerAgent({ id: "my-agent", name: "My Agent", model: "claude-opus-4-6" });
- *   await monitor.trackTokens("my-agent", { input: 1500, output: 300, thinking: 800 }, 0.012);
- *   await monitor.think("my-agent", "My Agent", "claude-opus-4-6", "thinking", "Analyzing the code...");
+ *   monitor.registerAgent({ id: "a1", name: "Agent", model: "claude-opus-4-6" });
+ *   monitor.trackTokens("a1", { input: 1500, output: 300 }, 0.012);
  */
 
 interface TokenDelta {
@@ -34,130 +33,143 @@ type AgentStatus = "idle" | "thinking" | "responding" | "tool_use" | "error" | "
 type ThinkingType = "thinking" | "response" | "tool_call" | "tool_result" | "error" | "system";
 type CommType = "request" | "response" | "delegation" | "result" | "error";
 
+interface BatchOp {
+  op: string;
+  data: Record<string, unknown>;
+}
+
 export class MonitorClient {
   private baseUrl: string;
   private apiKey?: string;
+  private queue: BatchOp[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private flushIntervalMs: number;
 
-  constructor(baseUrl: string, apiKey?: string) {
+  constructor(baseUrl: string, opts?: { apiKey?: string; flushIntervalMs?: number }) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.apiKey = apiKey;
+    this.apiKey = opts?.apiKey;
+    this.flushIntervalMs = opts?.flushIntervalMs ?? 100;
   }
 
-  private async post(path: string, body: unknown): Promise<unknown> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+  // ─── Core: fire-and-forget with auto-batching ──────
 
-    try {
-      const res = await fetch(`${this.baseUrl}${path}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      });
-      return res.json();
-    } catch (err) {
-      console.error(`[Monitor] POST ${path} failed:`, err);
-      return null;
+  private enqueue(op: string, data: Record<string, unknown>): void {
+    this.queue.push({ op, data });
+    if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => this.flush(), this.flushIntervalMs);
     }
   }
 
-  // ─── Agent lifecycle ────────────────────────────────
+  /** Send all queued ops in one HTTP call. Non-blocking. */
+  flush(): void {
+    if (this.queue.length === 0) return;
+    const batch = this.queue.splice(0);
+    this.flushTimer = null;
 
-  async registerAgent(params: RegisterAgentParams) {
-    return this.post("/api/monitor/agents", {
-      action: "register",
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+
+    // Fire and forget — no await, no .json() read
+    fetch(`${this.baseUrl}/api/monitor/batch`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(batch),
+    }).catch(() => {});
+  }
+
+  /** Flush and wait (only use at shutdown or in tests). */
+  async flushAsync(): Promise<void> {
+    if (this.queue.length === 0) return;
+    const batch = this.queue.splice(0);
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+
+    await fetch(`${this.baseUrl}/api/monitor/batch`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(batch),
+    }).catch(() => {});
+  }
+
+  // ─── Agent lifecycle (all fire-and-forget) ─────────
+
+  registerAgent(params: RegisterAgentParams): void {
+    this.enqueue("register", {
       ...params,
       provider: params.provider || "anthropic",
       status: params.status || "idle",
     });
   }
 
-  async setStatus(agentId: string, status: AgentStatus) {
-    return this.post("/api/monitor/agents", {
-      action: "status",
-      agentId,
-      status,
-    });
+  setStatus(agentId: string, status: AgentStatus): void {
+    this.enqueue("status", { agentId, status });
   }
 
-  async removeAgent(agentId: string) {
-    return this.post("/api/monitor/agents", {
-      action: "remove",
-      agentId,
-    });
+  removeAgent(agentId: string): void {
+    // This one goes direct since it's rare and needs to be reliable
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    fetch(`${this.baseUrl}/api/monitor/agents`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "remove", agentId }),
+    }).catch(() => {});
   }
 
   // ─── Token tracking ────────────────────────────────
 
-  async trackTokens(agentId: string, tokens: TokenDelta, costUsd: number = 0) {
-    return this.post("/api/monitor/agents", {
-      action: "tokens",
-      agentId,
-      tokens,
-      cost: costUsd,
-    });
+  trackTokens(agentId: string, tokens: TokenDelta, costUsd: number = 0): void {
+    this.enqueue("tokens", { agentId, tokens, cost: costUsd });
   }
 
   // ─── Thinking flow ─────────────────────────────────
 
-  async think(
+  think(
     agentId: string,
     agentName: string,
     model: string,
     type: ThinkingType,
     content: string,
-    opts?: { tokenCount?: number; durationMs?: number; metadata?: Record<string, unknown> },
-  ) {
-    return this.post("/api/monitor/thinking", {
+    opts?: { tokenCount?: number; durationMs?: number },
+  ): void {
+    this.enqueue("thinking", {
       agentId,
       agentName,
       model,
       type,
-      content,
+      content: content.slice(0, 800),
       ...opts,
     });
   }
 
   // ─── Agent communication ───────────────────────────
 
-  async comm(
+  comm(
     from: { id: string; name: string },
     to: { id: string; name: string },
     type: CommType,
     content: string,
     tokenCount?: number,
-  ) {
-    return this.post("/api/monitor/comms", {
+  ): void {
+    this.enqueue("comm", {
       fromAgentId: from.id,
       fromAgentName: from.name,
       toAgentId: to.id,
       toAgentName: to.name,
       type,
-      content,
+      content: content.slice(0, 500),
       tokenCount,
     });
   }
 
-  // ─── Custom metrics ────────────────────────────────
+  // ─── Convenience: send immediately (for one-offs) ──
 
-  async metric(name: string, value: number, opts?: { type?: string; unit?: string; tags?: Record<string, string> }) {
-    return this.post("/api/monitor/ingest", {
-      name,
-      value,
-      type: opts?.type || "gauge",
-      unit: opts?.unit,
-      tags: opts?.tags,
-    });
-  }
-
-  // ─── Logging ───────────────────────────────────────
-
-  async log(level: "debug" | "info" | "warn" | "error", message: string, service: string, meta?: Record<string, unknown>) {
-    return this.post("/api/monitor/logs", { level, message, service, meta });
-  }
-
-  // ─── Alerts ────────────────────────────────────────
-
-  async alert(severity: "critical" | "warning" | "info", title: string, message: string, source: string) {
-    return this.post("/api/monitor/alerts", { severity, title, message, source });
+  async sendNow(op: string, data: Record<string, unknown>): Promise<void> {
+    this.enqueue(op, data);
+    await this.flushAsync();
   }
 }
